@@ -112,13 +112,28 @@ class CepRuleService(BaseModuleService):
             }
             store.rows("alert_policy").append(alert_entry)
 
+            # 12号：逐条落 CEP 命中并合并到同源唯一活动方案，避免每次命中新建方案。
+            from app.services import incident_ledger
+
+            task_scope = rule.get("动作输出") or rule_name
+            merge = incident_ledger.record_cep_hits_from_matches(
+                cep_rule=rule_name,
+                task_scope=str(task_scope),
+                alert_rule_name=f"cep_{rule_name}",
+                matches=matches,
+            )
+        else:
+            merge = {"ingested": 0, "duplicates": 0}
+
         return {
             "ok": True,
             "rule": rule_name,
             "pattern": pattern,
+            "output_action": output_action if matches else "",
             "total_events": len(events),
             "matches": len(matches),
             "match_rate": len(matches) / max(len(events) - len(pattern) + 1, 1),
+            "merge": merge,
         }
 
     def evaluate_skip_strategy(

@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.routers import ROUTERS
+from app.routers import REGISTER_ORDER
 from app.store import store
 
 app = FastAPI(title="实时计算服务中心", version="2.0.0")
@@ -91,6 +91,6 @@ def list_failures(module: str | None = None) -> dict[str, Any]:
 
 
 # 资源路由含 /api/{module}，必须放在 health / overview 之后注册，
-# 否则固定路径会被动态路径抢先匹配。
-for module in ROUTERS:
+# 否则固定路径会被动态路径抢先匹配。incident 固定前缀优先于通用资源路由。
+for module in REGISTER_ORDER:
     app.include_router(module.router)

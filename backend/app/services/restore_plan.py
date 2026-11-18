@@ -2,12 +2,14 @@
 
 数据流角色: checkpoint_mgr / alert_policy → restore_plan（消费者）→ replay_engine（消费者）
 增强能力: 恢复方案演练/启用、恢复模式选择、位点策略管理、状态复用验证、恢复后校验
+12号能力: 消费告警合并清单，维护当前方案与历史周期的引用，保留恢复方案回执的来源版本
 """
 from __future__ import annotations
 
 import time
 from typing import Any
 
+from app.services import incident_ledger
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -22,6 +24,117 @@ class RestorePlanService(BaseModuleService):
     NEGATIVE_ACTIONS = []
 
     RESTORE_MODES = {"from_checkpoint", "restart", "escalation_response", "manual"}
+
+    # ---- 12号：告警合并清单 → 唯一活动恢复方案 ----
+
+    def consume_merge_manifest(self, manifest_id: str) -> dict[str, Any]:
+        """消费告警合并清单，挂到当前方案并核对周期引用。"""
+        manifest = store._manifests.get(manifest_id)
+        if manifest is None:
+            return {"ok": False, "error": f"告警合并清单「{manifest_id}」不存在"}
+        plan = store.find("restore_plan", int(manifest.get("plan_id", 0)))
+        if plan is None:
+            return {"ok": False, "error": f"合并清单 {manifest_id} 指向的恢复方案不存在"}
+        cycle = store._cycles.get(str(plan.get("_cycle_id")))
+        if cycle is None:
+            return {"ok": False, "error": f"恢复方案 {plan.get('id')} 缺少恢复周期引用"}
+        plan["_manifest_id"] = manifest_id
+        plan["_cycle_id"] = cycle["cycle_id"]
+        plan["_cycle_seq"] = cycle.get("seq", 0)
+        active = incident_ledger.active_plans_for_scope(str(plan.get("任务范围", "")))
+        return {
+            "ok": True,
+            "manifest_id": manifest_id,
+            "merge_count": manifest.get("merge_count", 0),
+            "hit_ids": list(manifest.get("hit_ids", [])),
+            "plan_id": plan.get("id"),
+            "plan_name": plan.get("方案名称", ""),
+            "cycle": {
+                "cycle_id": cycle["cycle_id"],
+                "seq": cycle.get("seq", 0),
+                "status": cycle.get("status", ""),
+            },
+            "active_plan_count": len(active),
+            "single_active_plan": len(active) == 1,
+        }
+
+    def list_plans_with_cycles(self) -> list[dict[str, Any]]:
+        """恢复页面：每个活动方案对应的周期、合并数量与触发证据。
+
+        只列出 12号同源合并生成的方案；手工登记的示例方案没有周期，不参与核对。
+        """
+        plans = [p for p in store.rows(self.MODULE) if p.get("_generated")]
+        return [incident_ledger.plan_evidence(p) for p in plans]
+
+    def plan_cycle_evidence(self, plan_id: int) -> dict[str, Any]:
+        plan = store.find(self.MODULE, int(plan_id))
+        if plan is None:
+            return {"ok": False, "error": f"恢复方案 {plan_id} 不存在"}
+        evidence = incident_ledger.plan_evidence(plan)
+        evidence["ok"] = True
+        return evidence
+
+    def active_plan_audit(self) -> dict[str, Any]:
+        """核对每个任务范围是否只有一个活动方案，以及清单与方案命中是否对应。"""
+        scopes = {
+            str(p.get("任务范围", ""))
+            for p in store.rows(self.MODULE)
+            if p.get("_generated")
+        }
+        audits = [incident_ledger.assert_single_active_plan(s) for s in sorted(scopes)]
+        cross_checks = incident_ledger.cross_check_manifest_plan()
+        return {
+            "ok": all(a["single"] for a in audits)
+            and all(c["matched"] for c in cross_checks),
+            "scopes": audits,
+            "cross_checks": cross_checks,
+        }
+
+    def recalculate_escalation(self, plan_id: int) -> dict[str, Any]:
+        """按累计触发次数重算恢复模式：连续告警升级但不新增方案。"""
+        plan = store.find(self.MODULE, int(plan_id))
+        if plan is None:
+            return {"ok": False, "error": f"恢复方案 {plan_id} 不存在"}
+        scope = str(plan.get("任务范围", ""))
+        count = len(plan.get("_hit_ids", []))
+        decision = self.select_optimal_recovery_mode(scope, count)
+        plan["恢复模式"] = decision["mode"]
+        plan["_trigger_count"] = count
+        plan["_merged_count"] = count
+        return {"ok": True, "plan_id": plan_id, "trigger_count": count, **decision}
+
+    def complete_plan_recovery(self, plan_id: int) -> dict[str, Any]:
+        """恢复完成：写入周期完成标记，保留方案与全部触发记录。"""
+        return incident_ledger.complete_recovery(plan_id)
+
+    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+        """12号：同源合并生成的方案，状态流转要同步周期，不能只改行状态。"""
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return None, f"{self.ENTITY} {entry_id} 不存在或已归档"
+
+        if entry.get("_generated"):
+            if entry.get("_closed_at") and action in ("演练方案", "启用方案"):
+                return None, (
+                    f"方案 {entry_id} 属于已关闭周期 #{entry.get('_cycle_seq')}，"
+                    "请在当前活动方案上操作"
+                )
+            if action == "启用方案":
+                result = incident_ledger.complete_recovery(entry_id)
+                if not result.get("ok"):
+                    return None, str(result.get("error", "启用失败"))
+                message = (
+                    f"恢复方案已启用，周期 #{result.get('cycle_seq')} 保留 "
+                    f"{result.get('hit_count')} 条触发记录"
+                )
+                return entry, message
+            if action == "演练方案":
+                entry["status"] = "已演练"
+                entry["pending"] = True
+                return entry, "恢复方案已演练，周期与触发证据保持不变"
+            return None, f"动作「{action}」不属于同源合并生成的恢复方案"
+
+        return super().run_action(entry_id, action)
 
     # ---- 跨模块数据管理 ----
 
@@ -231,4 +344,13 @@ class RestorePlanService(BaseModuleService):
         rows = store.rows(self.MODULE)
         base["drilled"] = sum(1 for r in rows if r.get("status") == "已演练")
         base["activated"] = sum(1 for r in rows if r.get("status") == "已生效")
+        base["active_plans"] = sum(
+            1 for r in rows if r.get("_generated") and not r.get("_closed_at")
+        )
+        base["merged_hits"] = sum(len(r.get("_hit_ids", [])) for r in rows)
+        base["cycles"] = len(store._cycles)
+        base["receipts"] = len(store._receipts)
+        base["receipt_versions"] = sorted(
+            {str(r.get("source_version")) for r in store._receipts.values()}
+        )
         return base

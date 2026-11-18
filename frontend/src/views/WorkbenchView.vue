@@ -28,6 +28,30 @@
       </span>
     </p>
 
+    <section v-if="showMigrationStrip" class="panel migration-strip" data-testid="migration-strip">
+      <header class="panel-head">
+        <h3>迁移台账（12号）</h3>
+        <span class="muted">
+          当前版本 <strong data-testid="strip-active-version">{{ migration.active_version || '—' }}</strong> ·
+          切换 {{ migration.switch_count }} 次 · 最近
+          <strong data-testid="strip-last-switch">{{ lastSwitchStatus }}</strong>
+        </span>
+      </header>
+      <p class="page-desc">
+        <template v-if="meta.key === 'alert_policy'">
+          同源 CEP 命中在告警页面合并后只对应一个当前恢复方案，可在此核对合并数量与触发证据。
+        </template>
+        <template v-else>
+          每次恢复方案回执按来源版本留存；活动方案与历史周期在恢复周期页面核对。
+        </template>
+      </p>
+      <div class="page-actions">
+        <RouterLink class="btn" data-testid="strip-alert-link" to="/alert/merge">告警合并清单</RouterLink>
+        <RouterLink class="btn" data-testid="strip-restore-link" to="/restore/cycles">恢复方案与周期</RouterLink>
+        <RouterLink class="btn primary" data-testid="strip-deploy-link" to="/deploy/migration">迁移与部署</RouterLink>
+      </div>
+    </section>
+
     <form class="filter-bar" @submit.prevent="reload">
       <label v-for="field in filterFields" :key="field" class="filter-item">
         <span>{{ field }}</span>
@@ -100,6 +124,7 @@ import {
   createEntry,
   downloadEntries,
   listEntries,
+  loadMigrationStatus,
   moduleMeta,
   runAction as applyAction,
 } from '@/api/backend-service'
@@ -115,6 +140,18 @@ const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+const migration = ref<{ active_version: string; switch_count: number; last_status: string }>({
+  active_version: '',
+  switch_count: 0,
+  last_status: '',
+})
+const showMigrationStrip = computed(() =>
+  ['alert_policy', 'restore_plan', 'cep_rule'].includes(meta.key),
+)
+const lastSwitchStatus = computed(() => {
+  if (!migration.value.last_status) return '暂无切换'
+  return migration.value.last_status === 'committed' ? '已提交' : '已回滚'
+})
 const stats = computed(() => [
   { label: meta.metrics[0], value: total.value },
   { label: meta.metrics[1], value: rows.value.filter((row) => row.status === meta.statuses[1]).length },
@@ -182,6 +219,14 @@ async function reload() {
     const payload = await listEntries(meta.key, filters.value)
     rows.value = payload.items
     total.value = payload.total
+    if (showMigrationStrip.value) {
+      const status = await loadMigrationStatus()
+      migration.value = {
+        active_version: status.active_version,
+        switch_count: status.deployment.switch_count,
+        last_status: String((status.ledger[0] as { status?: string } | undefined)?.status ?? ''),
+      }
+    }
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '业务列表读取失败'
   }

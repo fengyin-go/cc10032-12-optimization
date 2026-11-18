@@ -2,12 +2,14 @@
 
 数据流角色: anomaly_detector / cep_rule → alert_policy（消费者+生产者）→ restore_plan（消费者）
 增强能力: 告警升级路径、沉默窗口计算、通知分发、批量告警合并且入 restore_plan
+12号能力: 读取 CEP 命中告警数据，按同源（CEP 规则 + 任务范围）合并，同源只对应一个当前恢复方案
 """
 from __future__ import annotations
 
 import time
 from typing import Any
 
+from app.services import incident_ledger
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -118,7 +120,11 @@ class AlertPolicyService(BaseModuleService):
         }
 
     def escalate_alert(self, rule_name: str) -> dict[str, Any]:
-        """告警升级：按升级路径提升告警级别并写入 restore_plan。"""
+        """告警升级：按升级路径提升级别，并合并到同源当前恢复方案。
+
+        12号修正：不再每次升级都新建方案。同一任务范围已有活动方案时，
+        升级只提升级别、累计触发次数并回写合并清单，方案数量保持为一。
+        """
         rule = None
         for r in store.rows(self.MODULE):
             if r.get("规则名称") == rule_name:
@@ -137,13 +143,35 @@ class AlertPolicyService(BaseModuleService):
                 "CRITICAL",
             )
 
+        scope = rule.get("监控指标", "default_scope")
+        active = incident_ledger.active_plans_for_scope(str(scope))
+        if active:
+            plan = active[0]
+            plan["_trigger_count"] = int(plan.get("_trigger_count", 0)) + 1
+            plan["恢复模式"] = "escalation_response"
+            plan["跳过坏数据"] = "true"
+            plan["_escalated_from"] = current_level
+            plan["_escalated_to"] = next_level_name
+            rule["告警级别"] = next_level_name
+            return {
+                "ok": True,
+                "rule": rule_name,
+                "escalated_from": current_level,
+                "escalated_to": next_level_name,
+                "path": escalation_path,
+                "restore_plan_id": plan.get("id"),
+                "merged_into_existing": True,
+                "merge_count": len(plan.get("_hit_ids", [])),
+                "message": "同源告警已合并到当前恢复方案，未新建方案",
+            }
+
         # 在 restore_plan 中创建恢复方案
         plan = {
             "id": max(
                 (int(r.get("id", 0)) for r in store.rows("restore_plan")), default=0
             ) + 1,
             "方案名称": f"告警恢复_{rule_name}_{int(time.time())}",
-            "任务范围": rule.get("监控指标", "default_scope"),
+            "任务范围": scope,
             "恢复模式": "escalation_response",
             "源位点策略": "latest_alert",
             "状态复用": "resolved",
@@ -167,6 +195,8 @@ class AlertPolicyService(BaseModuleService):
             "escalated_to": next_level_name,
             "path": escalation_path,
             "restore_plan_id": plan["id"],
+            "merged_into_existing": False,
+            "message": "该范围尚无活动恢复方案，已新建并占用唯一活动位",
         }
 
     def batch_merge_alerts(self) -> dict[str, Any]:
@@ -195,6 +225,101 @@ class AlertPolicyService(BaseModuleService):
             "ok": True,
             "rules_merged": len(merges),
             "detail": merges,
+        }
+
+    # ---- 12号：CEP 命中 → 同源合并清单 ----
+
+    def ingest_cep_hits(
+        self,
+        *,
+        cep_rule: str,
+        task_scope: str,
+        alert_rule_name: str,
+        matches: list[dict[str, Any]] | None = None,
+        hits: list[dict[str, Any]] | None = None,
+        mode: str = "auto",
+        environment: str | None = None,
+    ) -> dict[str, Any]:
+        """读取 CEP 命中告警数据，逐条落证据后合并为同源清单。
+
+        `hits` 每项需含 match_start_ts / match_end_ts / event_count；
+        若只给 `matches`（CEP 匹配结果），则按匹配窗口换算触发证据。
+        """
+        raw = list(hits or [])
+        if not raw and matches:
+            for m in matches:
+                events = m.get("events") or []
+                raw.append({
+                    "match_start_ts": m.get("start_ts", 0),
+                    "match_end_ts": m.get("end_ts", 0),
+                    "event_count": len(events),
+                    "pattern": ",".join(str(e.get("event_type", "")) for e in events),
+                })
+        if not raw:
+            return {"ok": False, "error": "没有 CEP 命中告警数据可合并", "ingested": 0}
+
+        results = []
+        for item in raw:
+            results.append(
+                incident_ledger.record_cep_hit(
+                    cep_rule=cep_rule,
+                    task_scope=task_scope,
+                    alert_rule_name=alert_rule_name,
+                    match_start_ts=float(item.get("match_start_ts", 0)),
+                    match_end_ts=float(item.get("match_end_ts", 0)),
+                    event_count=int(item.get("event_count", 0)),
+                    pattern=str(item.get("pattern", "")),
+                    environment=environment,
+                    mode=mode,
+                    hit_id=item.get("hit_id"),
+                )
+            )
+        failed = [r for r in results if not r.get("ok")]
+        merged = [r for r in results if r.get("ok")]
+        first = merged[0] if merged else {}
+        return {
+            "ok": not failed,
+            "ingested": len(merged),
+            "duplicates": sum(1 for r in merged if r.get("duplicate")),
+            "rotated": any(r.get("rotated") for r in merged),
+            "reopened": any(r.get("reopened") for r in merged),
+            "manifest_id": first.get("manifest_id"),
+            "plan_id": first.get("plan_id"),
+            "cycle_id": first.get("cycle_id"),
+            "merge_count": first.get("merge_count"),
+            "active_plan_count": first.get("active_plan_count"),
+            "errors": [r.get("error") for r in failed],
+        }
+
+    def list_merge_manifests(self) -> list[dict[str, Any]]:
+        """告警页面的合并清单：每个同源组一行，含合并数量与触发证据。"""
+        scopes: dict[str, dict[str, Any]] = {}
+        for row in incident_ledger.manifest_rows():
+            key = row["source_key"]
+            bucket = scopes.setdefault(key, {
+                "source_key": key,
+                "cep_rule": row["cep_rule"],
+                "task_scope": row["task_scope"],
+                "manifest_count": 0,
+                "merged_hit_total": 0,
+                "manifests": [],
+            })
+            bucket["manifest_count"] += 1
+            bucket["merged_hit_total"] += row["merge_count"]
+            bucket["manifests"].append(row)
+        return sorted(scopes.values(), key=lambda b: b["task_scope"])
+
+    def alert_merge_summary(self) -> dict[str, Any]:
+        """告警页面顶部：合并数量、活动方案数与覆盖任务范围。"""
+        rows = incident_ledger.manifest_rows()
+        return {
+            "manifest_count": len(rows),
+            "merged_hit_total": sum(r["merge_count"] for r in rows),
+            "cepHitTotal": sum(r["hit_count_evidence"] for r in rows),
+            "scopes": sorted({r["task_scope"] for r in rows}),
+            "active_plan_ids": [r["plan_id"] for r in rows if r["is_current_plan"]],
+            "active_version": store._migration.get("active_version"),
+            "environment": store._migration.get("environment"),
         }
 
     def list_active_alerts(self) -> list[dict[str, Any]]:

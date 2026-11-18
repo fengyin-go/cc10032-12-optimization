@@ -7,11 +7,24 @@
 from __future__ import annotations
 
 import copy
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.seed import SEED_ROWS
+from app.seed import (
+    SEED_ALERT_HITS,
+    SEED_CYCLES,
+    SEED_MERGE_MANIFESTS,
+    SEED_RECEIPTS,
+    SEED_ROWS,
+)
+
+# 迁移版本：旧环境与迁移后的目标版本。回执按来源版本留存，不因切换而覆盖。
+LEGACY_VERSION = "legacy-v1"
+TARGET_VERSION = "v2-migrated"
+KNOWN_VERSIONS = (LEGACY_VERSION, TARGET_VERSION)
+DEFAULT_ENVIRONMENT = "dev"
 
 
 @dataclass
@@ -89,6 +102,43 @@ class Store:
         self._channels: dict[str, DataChannelEvent] = {}
         # 失败恢复记录：recovery_id → FailureRecovery
         self._failures: dict[str, FailureRecovery] = {}
+        # ---- 12号：CEP 命中 → 同源合并 → 唯一活动恢复方案 ----
+        # 告警合并清单：manifest_id → 合并清单，一行代表一个同源告警组
+        self._manifests: dict[str, dict[str, Any]] = {
+            item["manifest_id"]: copy.deepcopy(item) for item in SEED_MERGE_MANIFESTS
+        }
+        # CEP 命中告警数据：hit_id → 单次命中（不可丢，合并后仍逐条保留）
+        self._alert_hits: dict[str, dict[str, Any]] = {
+            item["hit_id"]: copy.deepcopy(item) for item in SEED_ALERT_HITS
+        }
+        # 恢复周期：cycle_id → 周期（current / closed）
+        self._cycles: dict[str, dict[str, Any]] = {
+            item["cycle_id"]: copy.deepcopy(item) for item in SEED_CYCLES
+        }
+        # 恢复方案回执：receipt_id → 回执（按 source_version 留存）
+        self._receipts: dict[str, dict[str, Any]] = {
+            item["receipt_id"]: copy.deepcopy(item) for item in SEED_RECEIPTS
+        }
+        # 环境切换记录：受环境影响的发布单，重复切换只生效一次
+        self._deployments: dict[str, dict[str, Any]] = {
+            "deploy_12": {
+                "deployment_id": "deploy_12",
+                "name": "12号迁移发布单",
+                "environments": {DEFAULT_ENVIRONMENT: LEGACY_VERSION},
+                "switches": [],
+                "applied": {},
+            }
+        }
+        # 迁移状态：当前生效版本、最近一次切换结果、事务日志
+        self._migration: dict[str, Any] = {
+            "active_version": LEGACY_VERSION,
+            "environment": DEFAULT_ENVIRONMENT,
+            "last_switch": None,
+            "ledger": [],
+        }
+        # 幂等守护：同一 switch_key 只允许成功一次；事务期间串行化
+        self._applied_switches: dict[str, dict[str, Any]] = {}
+        self._lock = threading.RLock()
 
     # ---- 跨模块数据通道 ----
 

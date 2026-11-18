@@ -11,12 +11,18 @@
 .
 ├── frontend/                 Vue 3 + Vite + TypeScript 前端
 │   ├── src/views/WorkbenchView.vue|tsx  全部模块共享工作台
+│   ├── src/views/AlertMergeView.vue     告警合并清单（12号）
+│   ├── src/views/RestoreCycleView.vue   恢复方案与周期（12号）
+│   ├── src/views/DeployMigrationView.vue 迁移与部署（12号）
 │   ├── src/data/modules.ts              18个业务模块配置
 │   ├── src/api/              统一请求封装
 │   └── vite.config.ts        dev server 配置（open: false）
 ├── backend/                  FastAPI（Python） 后端
 │   ├── app/routers/resource.py  通用查询/导出/登记/动作接口
+│   ├── app/routers/incident.py  告警合并/恢复周期/迁移切换接口（12号）
 │   ├── app/services/<key>.py    每个模块独立领域逻辑
+│   ├── app/services/incident_ledger.py 同源合并、周期、回执台账（12号）
+│   ├── app/services/migration_switch.py 切换路径、幂等与事务回滚（12号）
 │   ├── app/services/base.py     共享服务骨架
 │   └── app/store.py          内存数据仓库与示例数据
 ├── .gitignore
@@ -78,6 +84,47 @@ npm run dev
   `frontend/src/domain/<模块>.ts`，用于承载真实业务差异并维持36题位容量。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+
+## 12号：同源告警合并与迁移切换
+
+告警升级不再为每次 CEP 命中新建恢复方案。一次命中是一条不可丢失的触发记录，
+同源（CEP 规则 + 任务范围）的连续命中共用一份合并清单和一个当前恢复方案。
+
+页面（左侧导航前三项）：
+
+| 页面 | 路径 | 作用 |
+| --- | --- | --- |
+| 告警合并清单 | `/alert/merge` | 查看 CEP 命中数据、合并数量与触发证据，可模拟连续命中 |
+| 恢复方案与周期 | `/restore/cycles` | 确认每个活动方案对应的周期、触发证据、回执版本与构建流水线 |
+| 迁移与部署 | `/deploy/migration` | 两条切换路径取舍、执行切换、迁移台账与迁移后核对 |
+
+业务约束：
+
+- 同源告警只对应一个当前恢复方案；同一任务范围最终只有一个活动恢复范围。
+- 合并后保留全部触发记录（`_hit_ids` / 合并清单的 `hit_ids`），关闭的周期同样保留。
+- 恢复完成后同一规则再次连续触发有两种处理：`extend` 合并延长当前方案，
+  `auto`/`new_cycle` 关闭上一周期后开启新方案；页面始终只有一个活动恢复方案。
+- 恢复方案回执按 `source_version` 留存：迁移后保留 `legacy-v1` 回执并追加
+  `v2-migrated` 回执，不覆盖旧版本。
+- 环境切换以 `switch_key` 幂等，重复提交只生效一次（并发下同样只提交一次）；
+  事务失步时快照回滚原版本，失败不占用幂等键，可修复后重试。
+- 两条切换路径：`atomic` 整批一致回滚，`rolling` 逐方案迁移补偿回滚。
+
+关键接口：
+
+```text
+GET  /api/incidents/merge-manifests          告警合并清单与合并数量
+GET  /api/incidents/cep-hits                 逐条 CEP 命中告警数据
+POST /api/incidents/cep-hits                 写入命中并同源合并
+GET  /api/incidents/restore-plans            方案 → 周期 → 证据 → 回执
+POST /api/incidents/restore-plans/{id}/complete
+GET  /api/incidents/receipts                 按来源版本留存回执
+GET  /api/migration/status                   迁移前后结果与台账
+GET  /api/migration/paths                    两种切换路径取舍
+GET  /api/migration/build-pipeline           部署页/恢复详情构建流水线
+GET  /api/migration/trace                    顺 CEP 调用链定位旧环境数据
+POST /api/migration/switch                   执行切换（幂等 + 事务回滚）
+```
 
 领域：数据工程
 子方向：数据分析与数据应用

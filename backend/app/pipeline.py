@@ -391,8 +391,12 @@ def match_cep_pattern(
 def trigger_alert_for_cep_matches(
     matches: list[dict[str, Any]],
     alert_rule_name: str,
+    *,
+    task_scope: str | None = None,
+    cep_rule: str | None = None,
+    mode: str = "auto",
 ) -> dict[str, Any]:
-    """根据CEP匹配结果触发告警。"""
+    """根据CEP匹配结果触发告警，并按同源合并进唯一活动恢复方案。"""
     if not matches:
         return {"triggered": False, "reason": "无匹配事件序列", "rule": alert_rule_name}
     # 查找告警策略
@@ -404,6 +408,7 @@ def trigger_alert_for_cep_matches(
     if alert_row is None:
         return {"triggered": False, "reason": f"未找到告警规则 {alert_rule_name}"}
     level = alert_row.get("告警级别", "WARNING")
+    scope = task_scope or alert_row.get("监控指标") or alert_rule_name
     alert_entry = {
         "rule_name": alert_rule_name,
         "level": level,
@@ -414,34 +419,77 @@ def trigger_alert_for_cep_matches(
         "status": "已启用",
     }
     store.rows("alert_policy").append(alert_entry)
-    return {"triggered": True, "level": level, "matches": len(matches), "rule": alert_rule_name}
+
+    from app.services import incident_ledger
+
+    merged = incident_ledger.record_cep_hits_from_matches(
+        cep_rule=cep_rule or alert_rule_name,
+        task_scope=str(scope),
+        alert_rule_name=alert_rule_name,
+        matches=matches,
+        mode=mode,
+    )
+    return {
+        "triggered": True,
+        "level": level,
+        "matches": len(matches),
+        "rule": alert_rule_name,
+        "merge": merged,
+    }
 
 
 def generate_restore_plan(
     trigger_count: int,
     task_scope: str,
+    *,
+    cep_rule: str | None = None,
+    mode: str = "auto",
+    match_window: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
-    """根据告警触发次数生成故障恢复方案。"""
+    """根据告警触发次数生成或合并恢复方案。
+
+    12号：同一任务范围已有活动方案时不再新建，而是合并触发记录并延长处理。
+    """
     if trigger_count == 0:
         return {"plan_created": False, "reason": "无告警触发，无需恢复方案"}
-    plan = {
-        "id": max(
-            (int(r.get("id", 0)) for r in store.rows("restore_plan")), default=0
-        ) + 1,
-        "方案名称": f"自动恢复_{task_scope}_{int(time.time())}",
-        "任务范围": task_scope,
-        "恢复模式": "from_checkpoint" if trigger_count > 3 else "restart",
-        "源位点策略": "latest_snapshot",
-        "状态复用": "reuse_existing",
-        "跳过坏数据": "true" if trigger_count > 5 else "false",
-        "验证步骤": "state_consistency,event_replay",
-        "status": "草稿",
-        "pending": True,
-        "abnormal": False,
-        "_trigger_count": trigger_count,
-    }
-    store.rows("restore_plan").append(plan)
-    plan["plan_created"] = True
+
+    from app.services import incident_ledger
+
+    scope = str(task_scope)
+    existing = incident_ledger.active_plans_for_scope(scope)
+    now = time.time()
+    start, end = match_window or (now, now)
+    if existing:
+        plan = existing[0]
+        manifest = incident_ledger.current_manifest_for(str(plan.get("_source_key", "")))
+        merged = {
+            "ok": True,
+            "plan_id": plan.get("id"),
+            "manifest_id": (manifest or {}).get("manifest_id"),
+            "merge_count": (manifest or {}).get("merge_count", 0),
+            "active_plan_count": len(existing),
+        }
+        return {
+            "id": plan.get("id"),
+            "方案名称": plan.get("方案名称", ""),
+            "plan_created": False,
+            "merged": True,
+            "merge": merged,
+        }
+
+    source_key = incident_ledger.source_key_of(cep_rule or "auto_restore", scope)
+    result = incident_ledger.record_cep_hit(
+        cep_rule=cep_rule or "auto_restore",
+        task_scope=scope,
+        alert_rule_name="自动恢复",
+        match_start_ts=start,
+        match_end_ts=end,
+        event_count=trigger_count,
+        mode=mode,
+    )
+    plan = store.find("restore_plan", int(result.get("plan_id", 0) or 0)) or {}
+    plan["plan_created"] = bool(result.get("ok"))
+    plan["_source_key"] = source_key
     return plan
 
 

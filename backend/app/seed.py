@@ -465,7 +465,34 @@ SEED_ROWS: dict[str, list[dict[str, Any]]] = {
   '源位点策略': '故障恢复样例3',
   '状态复用': '故障恢复样例3',
   '跳过坏数据': '故障恢复样例3',
-  '验证步骤': '故障恢复样例3'}],
+  '验证步骤': '故障恢复样例3'},
+ # 12号：同一任务范围（login_security）下连续 CEP 命中合并后的唯一活动恢复方案。
+ # _hit_ids 保留全部触发记录，_source_version 记录方案来源版本。
+ {'id': 4,
+  'status': '草稿',
+  'pending': True,
+  'abnormal': False,
+  '方案名称': '自动恢复_login_security_c1',
+  '任务范围': 'login_security',
+  '恢复模式': 'restart',
+  '源位点策略': 'latest_snapshot',
+  '状态复用': 'reuse_existing',
+  '跳过坏数据': 'false',
+  '验证步骤': 'state_consistency,event_replay',
+  '_generated': True,
+  '_source_key': '登录失败序列::login_security',
+  '_cep_rule': '登录失败序列',
+  '_alert_rule': '登录失败告警规则',
+  '_environment': 'dev',
+  '_manifest_id': 'manifest_login_1',
+  '_cycle_id': 'cycle_login_1',
+  '_cycle_seq': 1,
+  '_hit_ids': ['hit_login_1', 'hit_login_2', 'hit_login_3'],
+  '_trigger_count': 3,
+  '_merged_count': 3,
+  '_last_hit_ts': 1793000300.0,
+  '_source_version': 'legacy-v1',
+  '_created_at': 1793000300.0}],
     "metric_lineage": [{'id': 1,
   'status': '正常',
   'pending': True,
@@ -764,3 +791,135 @@ SEED_ROWS: dict[str, list[dict[str, Any]]] = {
   '结果验证': '回放引擎样例3',
   '进度': '回放引擎样例3'}],
 }
+
+# ---------------------------------------------------------------------------
+# 12号告警合并 / 恢复周期 / 恢复方案回执
+# 一次 CEP 命中 = 一条不可丢失的触发记录；同源多次命中合并进同一份清单和同一活动方案。
+# ---------------------------------------------------------------------------
+
+_CEP_SOURCE = "登录失败序列"
+_LOGIN_SCOPE = "login_security"
+
+SEED_ALERT_HITS: list[dict[str, Any]] = [
+    {
+        "hit_id": "hit_login_1",
+        "source_key": f"{_CEP_SOURCE}::{_LOGIN_SCOPE}",
+        "cep_rule": "登录失败序列",
+        "task_scope": _LOGIN_SCOPE,
+        "alert_rule_name": "登录失败告警规则",
+        "match_start_ts": 1792999900.0,
+        "match_end_ts": 1792999950.0,
+        "event_count": 3,
+        "pattern": "login_fail,login_fail,login_fail",
+        "source_version": "legacy-v1",
+        "environment": "dev",
+        "status": "merged",
+        "manifest_id": "manifest_login_1",
+    },
+    {
+        "hit_id": "hit_login_2",
+        "source_key": f"{_CEP_SOURCE}::{_LOGIN_SCOPE}",
+        "cep_rule": "登录失败序列",
+        "task_scope": _LOGIN_SCOPE,
+        "alert_rule_name": "登录失败告警规则",
+        "match_start_ts": 1793000100.0,
+        "match_end_ts": 1793000150.0,
+        "event_count": 4,
+        "pattern": "login_fail,login_fail,login_fail",
+        "source_version": "legacy-v1",
+        "environment": "dev",
+        "status": "merged",
+        "manifest_id": "manifest_login_1",
+    },
+    {
+        "hit_id": "hit_login_3",
+        "source_key": f"{_CEP_SOURCE}::{_LOGIN_SCOPE}",
+        "cep_rule": "登录失败序列",
+        "task_scope": _LOGIN_SCOPE,
+        "alert_rule_name": "登录失败告警规则",
+        "match_start_ts": 1793000250.0,
+        "match_end_ts": 1793000300.0,
+        "event_count": 5,
+        "pattern": "login_fail,login_fail,login_fail",
+        "source_version": "legacy-v1",
+        "environment": "dev",
+        "status": "merged",
+        "manifest_id": "manifest_login_1",
+    },
+]
+
+SEED_MERGE_MANIFESTS: list[dict[str, Any]] = [
+    {
+        "manifest_id": "manifest_login_1",
+        "source_key": f"{_CEP_SOURCE}::{_LOGIN_SCOPE}",
+        "cep_rule": "登录失败序列",
+        "task_scope": _LOGIN_SCOPE,
+        "alert_rule_name": "登录失败告警规则",
+        "plan_id": 4,
+        "plan_name": "自动恢复_login_security_c1",
+        "cycle_id": "cycle_login_1",
+        "cycle_seq": 1,
+        "hit_ids": ["hit_login_1", "hit_login_2", "hit_login_3"],
+        "merge_count": 3,
+        "status": "merged",
+        "source_version": "legacy-v1",
+        "environment": "dev",
+        "first_hit_ts": 1792999900.0,
+        "last_hit_ts": 1793000300.0,
+        "merged_at": 1793000300.0,
+    }
+]
+
+SEED_CYCLES: list[dict[str, Any]] = [
+    {
+        "cycle_id": "cycle_login_1",
+        "source_key": f"{_CEP_SOURCE}::{_LOGIN_SCOPE}",
+        "task_scope": _LOGIN_SCOPE,
+        "seq": 1,
+        "plan_id": 4,
+        "plan_name": "自动恢复_login_security_c1",
+        "manifest_id": "manifest_login_1",
+        "hit_ids": ["hit_login_1", "hit_login_2", "hit_login_3"],
+        "status": "current",
+        "source_version": "legacy-v1",
+        "environment": "dev",
+        "opened_at": 1792999900.0,
+        "closed_at": None,
+        "close_reason": "",
+    }
+]
+
+SEED_RECEIPTS: list[dict[str, Any]] = [
+    {
+        "receipt_id": "receipt_login_c1_legacy",
+        "plan_id": 4,
+        "plan_name": "自动恢复_login_security_c1",
+        "cycle_id": "cycle_login_1",
+        "cycle_seq": 1,
+        "manifest_id": "manifest_login_1",
+        "source_version": "legacy-v1",
+        "environment": "dev",
+        "kind": "plan_generated",
+        "hit_count": 3,
+        "switch_id": "",
+        "status": "committed",
+        "created_at": 1793000300.0,
+        "detail": "旧环境生成合并恢复方案",
+    },
+    {
+        "receipt_id": "receipt_login_c1_v2",
+        "plan_id": 4,
+        "plan_name": "自动恢复_login_security_c1",
+        "cycle_id": "cycle_login_1",
+        "cycle_seq": 1,
+        "manifest_id": "manifest_login_1",
+        "source_version": "v2-migrated",
+        "environment": "dev",
+        "kind": "migration_switch",
+        "hit_count": 3,
+        "switch_id": "switch_seed_v2",
+        "status": "committed",
+        "created_at": 1793000400.0,
+        "detail": "dev 环境切换到 v2-migrated 时留存的回执",
+    },
+]
